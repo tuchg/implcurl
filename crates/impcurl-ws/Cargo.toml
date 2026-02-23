@@ -1,0 +1,17 @@
+[package]
+name = "impcurl-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+impcurl = { path = "../impcurl" }
+impcurl-sys = { path = "../impcurl-sys" }
+libc = "0.2"
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

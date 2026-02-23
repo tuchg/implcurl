@@ -1,0 +1,11 @@
+[package]
+name = "impcurl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+impcurl-sys = { path = "../impcurl-sys" }
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["time"] }

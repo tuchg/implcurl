@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CRATE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+DEFAULT_PACKAGE="impcurl-ws"
+DEFAULT_EXAMPLE="gmgn_smoke"
+
+TARGET="$(rustc -vV | awk '/^host: / {print $2}')"
+PACKAGE="${DEFAULT_PACKAGE}"
+BIN_NAME=""
+EXAMPLE_NAME="${DEFAULT_EXAMPLE}"
+LIB_PATH="${CURL_IMPERSONATE_LIB:-}"
+OUT_DIR="${CRATE_ROOT}/dist"
+DEBUG=0
+SKIP_BUILD=0
+ALLOW_MISSING_LIB=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/package [options]
+
+Options:
+  --target <triple>       Rust target triple (default: rustc host target)
+  --package <name>        Cargo package name (default: impcurl-ws)
+  --bin <name>            Package a binary target
+  --example <name>        Package an example target (default: gmgn_smoke)
+  --lib <path>            Path to runtime libcurl-impersonate library
+  --out-dir <dir>         Output directory (default: ./dist)
+  --debug                 Build debug profile (default: release)
+  --skip-build            Skip cargo build
+  --allow-missing-lib     Package artifact even if runtime library is not found
+  -h, --help              Show this help
+
+Exactly one of --bin or --example is used. If --bin is provided, --example is ignored.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)
+      TARGET="$2"
+      shift 2
+      ;;
+    --package)
+      PACKAGE="$2"
+      shift 2
+      ;;
+    --bin)
+      BIN_NAME="$2"
+      shift 2
+      ;;
+    --example)
+      EXAMPLE_NAME="$2"
+      shift 2
+      ;;
+    --lib)
+      LIB_PATH="$2"
+      shift 2
+      ;;
+    --out-dir)
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    --debug)
+      DEBUG=1
+      shift
+      ;;
+    --skip-build)
+      SKIP_BUILD=1
+      shift
+      ;;
+    --allow-missing-lib)
+      ALLOW_MISSING_LIB=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -n "${BIN_NAME}" ]]; then
+  TARGET_KIND="bin"
+  TARGET_NAME="${BIN_NAME}"
+  BUILD_ARGS=(--bin "${TARGET_NAME}")
+  ARTIFACT_SUBDIR=""
+else
+  TARGET_KIND="example"
+  TARGET_NAME="${EXAMPLE_NAME}"
+  BUILD_ARGS=(--example "${TARGET_NAME}")
+  ARTIFACT_SUBDIR="examples/"
+fi
+
+if [[ -z "${TARGET_NAME}" ]]; then
+  echo "error: target name is empty" >&2
+  exit 1
+fi
+
+if [[ "${DEBUG}" -eq 1 ]]; then
+  PROFILE_DIR="debug"
+  PROFILE_NAME="debug"
+else
+  PROFILE_DIR="release"
+  PROFILE_NAME="release"
+fi
+
+if [[ "${TARGET}" == *windows* ]]; then
+  EXE_SUFFIX=".exe"
+  LIB_CANDIDATES=("curl-impersonate.dll" "libcurl-impersonate.dll" "libcurl.dll")
+  LIB_GLOBS=("*.dll")
+else
+  EXE_SUFFIX=""
+  if [[ "${TARGET}" == *apple-darwin* || "${TARGET}" == *darwin* ]]; then
+    LIB_CANDIDATES=("libcurl-impersonate.4.dylib" "libcurl-impersonate.dylib")
+    LIB_GLOBS=("*.dylib")
+  else
+    LIB_CANDIDATES=("libcurl-impersonate.so.4" "libcurl-impersonate.so")
+    LIB_GLOBS=("*.so" "*.so.*")
+  fi
+fi
+
+if [[ "${SKIP_BUILD}" -eq 0 ]]; then
+  cmd=(cargo build -p "${PACKAGE}" "${BUILD_ARGS[@]}" --target "${TARGET}")
+  if [[ "${DEBUG}" -eq 0 ]]; then
+    cmd+=(--release)
+  fi
+  echo "+ ${cmd[*]}"
+  (cd "${CRATE_ROOT}" && "${cmd[@]}")
+fi
+
+TARGET_DIR="${CARGO_TARGET_DIR:-${CRATE_ROOT}/target}"
+ARTIFACT_PATH="${TARGET_DIR}/${TARGET}/${PROFILE_DIR}/${ARTIFACT_SUBDIR}${TARGET_NAME}${EXE_SUFFIX}"
+if [[ ! -f "${ARTIFACT_PATH}" ]]; then
+  ARTIFACT_PATH="${TARGET_DIR}/${PROFILE_DIR}/${ARTIFACT_SUBDIR}${TARGET_NAME}${EXE_SUFFIX}"
+fi
+if [[ ! -f "${ARTIFACT_PATH}" ]]; then
+  echo "error: built artifact not found: ${ARTIFACT_PATH}" >&2
+  exit 1
+fi
+
+resolve_lib_path() {
+  local candidate name base pyver
+  if [[ -n "${LIB_PATH}" ]]; then
+    if [[ -f "${LIB_PATH}" ]]; then
+      echo "${LIB_PATH}"
+      return 0
+    fi
+    echo "error: --lib does not exist: ${LIB_PATH}" >&2
+    exit 1
+  fi
+
+  if [[ -n "${CURL_IMPERSONATE_LIB:-}" && -f "${CURL_IMPERSONATE_LIB}" ]]; then
+    echo "${CURL_IMPERSONATE_LIB}"
+    return 0
+  fi
+
+  for name in "${LIB_CANDIDATES[@]}"; do
+    candidate="${CRATE_ROOT}/vendor/${TARGET}/lib/${name}"
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+
+  for name in "${LIB_CANDIDATES[@]}"; do
+    candidate="${HOME}/.cuimp/binaries/${name}"
+    if [[ -f "${candidate}" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+
+  for base in \
+    "${HOME}/miniconda3/lib" \
+    "${HOME}/anaconda3/lib" \
+    "${HOME}/.local/lib" \
+    "/opt/homebrew/Caskroom/miniconda/base/lib"; do
+    [[ -d "${base}" ]] || continue
+    shopt -s nullglob
+    for pyver in "${base}"/python*/site-packages/curl_cffi/.dylibs; do
+      [[ -d "${pyver}" ]] || continue
+      for name in "${LIB_CANDIDATES[@]}"; do
+        candidate="${pyver}/${name}"
+        if [[ -f "${candidate}" ]]; then
+          shopt -u nullglob
+          echo "${candidate}"
+          return 0
+        fi
+      done
+    done
+    shopt -u nullglob
+  done
+
+  return 1
+}
+
+RUNTIME_LIB=""
+if RUNTIME_LIB="$(resolve_lib_path)"; then
+  :
+elif [[ "${ALLOW_MISSING_LIB}" -eq 1 ]]; then
+  RUNTIME_LIB=""
+else
+  echo "error: failed to locate runtime library. use --lib or set CURL_IMPERSONATE_LIB" >&2
+  exit 1
+fi
+
+OUT_ROOT="$(cd "$(dirname "${OUT_DIR}")" && pwd)/$(basename "${OUT_DIR}")"
+PACKAGE_ROOT="${OUT_ROOT}/${TARGET}"
+BIN_DIR="${PACKAGE_ROOT}/bin"
+LIB_DIR="${PACKAGE_ROOT}/lib"
+rm -rf "${PACKAGE_ROOT}"
+mkdir -p "${BIN_DIR}" "${LIB_DIR}"
+
+PACKAGED_BIN="${BIN_DIR}/$(basename "${ARTIFACT_PATH}")"
+cp "${ARTIFACT_PATH}" "${PACKAGED_BIN}"
+if [[ "${TARGET}" != *windows* ]]; then
+  chmod +x "${PACKAGED_BIN}"
+fi
+
+RUNTIME_LIBS=()
+if [[ -n "${RUNTIME_LIB}" ]]; then
+  shopt -s nullglob
+  for pattern in "${LIB_GLOBS[@]}"; do
+    for candidate in "$(dirname "${RUNTIME_LIB}")"/${pattern}; do
+      [[ -f "${candidate}" ]] || continue
+      cp "${candidate}" "${LIB_DIR}/"
+      RUNTIME_LIBS+=("${LIB_DIR}/$(basename "${candidate}")")
+    done
+  done
+  shopt -u nullglob
+
+  if [[ ! -f "${LIB_DIR}/$(basename "${RUNTIME_LIB}")" ]]; then
+    cp "${RUNTIME_LIB}" "${LIB_DIR}/"
+    RUNTIME_LIBS+=("${LIB_DIR}/$(basename "${RUNTIME_LIB}")")
+  fi
+fi
+
+relpath() {
+  local full="$1"
+  echo "${full#"${PACKAGE_ROOT}/"}"
+}
+
+MANIFEST="${PACKAGE_ROOT}/manifest.json"
+{
+  echo "{"
+  echo "  \"name\": \"${TARGET_NAME}\","
+  echo "  \"package\": \"${PACKAGE}\","
+  echo "  \"target_kind\": \"${TARGET_KIND}\","
+  echo "  \"target\": \"${TARGET}\","
+  echo "  \"profile\": \"${PROFILE_NAME}\","
+  echo "  \"built_at_utc\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\","
+  echo "  \"binary\": \"$(relpath "${PACKAGED_BIN}")\","
+  if [[ -n "${RUNTIME_LIB}" ]]; then
+    echo "  \"runtime_lib\": \"lib/$(basename "${RUNTIME_LIB}")\","
+  else
+    echo "  \"runtime_lib\": null,"
+  fi
+  echo "  \"runtime_libs\": ["
+  for i in "${!RUNTIME_LIBS[@]}"; do
+    comma=","
+    if [[ "${i}" -eq $((${#RUNTIME_LIBS[@]} - 1)) ]]; then
+      comma=""
+    fi
+    echo "    \"$(relpath "${RUNTIME_LIBS[$i]}")\"${comma}"
+  done
+  echo "  ],"
+  echo "  \"lib_candidates\": ["
+  for i in "${!LIB_CANDIDATES[@]}"; do
+    comma=","
+    if [[ "${i}" -eq $((${#LIB_CANDIDATES[@]} - 1)) ]]; then
+      comma=""
+    fi
+    echo "    \"${LIB_CANDIDATES[$i]}\"${comma}"
+  done
+  echo "  ]"
+  echo "}"
+} > "${MANIFEST}"
+
+ARCHIVE_PREFIX="${PACKAGE}"
+if [[ "${TARGET}" == *windows* ]]; then
+  ARCHIVE_PATH="${OUT_ROOT}/${ARCHIVE_PREFIX}-${TARGET}.zip"
+  rm -f "${ARCHIVE_PATH}"
+  if ! command -v zip >/dev/null 2>&1; then
+    echo "error: zip command is required for windows target archives" >&2
+    exit 1
+  fi
+  (cd "${PACKAGE_ROOT}" && zip -qry "${ARCHIVE_PATH}" .)
+else
+  ARCHIVE_PATH="${OUT_ROOT}/${ARCHIVE_PREFIX}-${TARGET}.tar.gz"
+  rm -f "${ARCHIVE_PATH}"
+  (cd "${PACKAGE_ROOT}" && tar -czf "${ARCHIVE_PATH}" .)
+fi
+
+echo "packaged root: ${PACKAGE_ROOT}"
+echo "archive: ${ARCHIVE_PATH}"
+if [[ -n "${RUNTIME_LIB}" ]]; then
+  echo "runtime lib: ${LIB_DIR}/$(basename "${RUNTIME_LIB}")"
+  echo "runtime lib count: ${#RUNTIME_LIBS[@]}"
+else
+  echo "runtime lib: <missing>"
+fi

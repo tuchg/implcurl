@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+VERSION="1.4.2"
+SOURCE="curl-cffi"
+CURL_CFFI_VERSION="0.11.3"
+TARGET="$(rustc -vV | awk '/^host: / {print $2}')"
+OUT_DIR=""
+KEEP_ARCHIVE=0
+
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/fetch-libcurl-impersonate [options]
+
+Download prebuilt libcurl-impersonate assets into vendor/<target>/lib.
+Default source uses curl_cffi wheel assets (release wheel + extract shared libs).
+
+Options:
+  --source <name>        Asset source: curl-cffi (default) | curl-impersonate
+  --target <triple>      Rust target triple (default: rustc host target)
+  --version <ver>        Alias of --lib-version
+  --lib-version <ver>    libcurl-impersonate version (default: 1.4.2)
+  --curl-cffi-version <ver> curl_cffi release version for source=curl-cffi (default: 0.11.3)
+  --out-dir <dir>        Output directory (default: vendor/<target>/lib)
+  --keep-archive         Keep downloaded archive
+  -h, --help             Show this help
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --source)
+      SOURCE="$2"
+      shift 2
+      ;;
+    --target)
+      TARGET="$2"
+      shift 2
+      ;;
+    --version)
+      VERSION="$2"
+      shift 2
+      ;;
+    --lib-version)
+      VERSION="$2"
+      shift 2
+      ;;
+    --curl-cffi-version)
+      CURL_CFFI_VERSION="$2"
+      shift 2
+      ;;
+    --out-dir)
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    --keep-archive)
+      KEEP_ARCHIVE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "${OUT_DIR}" ]]; then
+  OUT_DIR="${ROOT_DIR}/vendor/${TARGET}/lib"
+fi
+
+wheel_platform_from_target() {
+  local target="$1"
+  case "$target" in
+    x86_64-apple-darwin)
+      echo "macosx_10_9_x86_64"
+      ;;
+    aarch64-apple-darwin)
+      echo "macosx_11_0_arm64"
+      ;;
+    x86_64-unknown-linux-gnu)
+      echo "manylinux_2_17_x86_64.manylinux2014_x86_64"
+      ;;
+    aarch64-unknown-linux-gnu)
+      echo "manylinux_2_17_aarch64.manylinux2014_aarch64"
+      ;;
+    i686-unknown-linux-gnu)
+      echo "manylinux_2_17_i686.manylinux2014_i686"
+      ;;
+    x86_64-unknown-linux-musl)
+      echo "musllinux_1_1_x86_64"
+      ;;
+    aarch64-unknown-linux-musl)
+      echo "musllinux_1_1_aarch64"
+      ;;
+    x86_64-pc-windows-msvc|x86_64-pc-windows-gnu)
+      echo "win_amd64"
+      ;;
+    i686-pc-windows-msvc|i686-pc-windows-gnu)
+      echo "win32"
+      ;;
+    aarch64-pc-windows-msvc)
+      echo "win_arm64"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+arch_and_sysname_from_target() {
+  local target="$1"
+  case "$target" in
+    x86_64-apple-darwin)
+      echo "x86_64 macos"
+      ;;
+    aarch64-apple-darwin)
+      echo "arm64 macos"
+      ;;
+    x86_64-unknown-linux-gnu)
+      echo "x86_64 linux-gnu"
+      ;;
+    x86_64-unknown-linux-musl)
+      echo "x86_64 linux-musl"
+      ;;
+    aarch64-unknown-linux-gnu)
+      echo "aarch64 linux-gnu"
+      ;;
+    aarch64-unknown-linux-musl)
+      echo "aarch64 linux-musl"
+      ;;
+    i686-unknown-linux-gnu)
+      echo "i386 linux-gnu"
+      ;;
+    riscv64gc-unknown-linux-gnu)
+      echo "riscv64 linux-gnu"
+      ;;
+    armv7-unknown-linux-gnueabihf)
+      echo "arm linux-gnueabihf"
+      ;;
+    x86_64-pc-windows-msvc|x86_64-pc-windows-gnu)
+      echo "x86_64 win32"
+      ;;
+    i686-pc-windows-msvc|i686-pc-windows-gnu)
+      echo "i686 win32"
+      ;;
+    aarch64-pc-windows-msvc)
+      echo "arm64 win32"
+      ;;
+    aarch64-linux-android)
+      echo "aarch64 linux-android"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+if ! mapping="$(arch_and_sysname_from_target "${TARGET}")"; then
+  if [[ "${SOURCE}" == "curl-impersonate" ]]; then
+    echo "error: unsupported target triple: ${TARGET}" >&2
+    exit 1
+  fi
+fi
+
+case "${SOURCE}" in
+  curl-cffi)
+    if ! WHEEL_PLATFORM_TAG="$(wheel_platform_from_target "${TARGET}")"; then
+      echo "error: unsupported target for source=curl-cffi: ${TARGET}" >&2
+      exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "error: jq is required for source=curl-cffi (asset resolution via GitHub API)" >&2
+      exit 1
+    fi
+    RELEASE_API_URL="https://api.github.com/repos/lexiforest/curl_cffi/releases/tags/v${CURL_CFFI_VERSION}"
+    if command -v curl >/dev/null 2>&1; then
+      RELEASE_JSON="$(curl -fsSL "${RELEASE_API_URL}")"
+    elif command -v wget >/dev/null 2>&1; then
+      RELEASE_JSON="$(wget -qO- "${RELEASE_API_URL}")"
+    else
+      echo "error: curl or wget is required" >&2
+      exit 1
+    fi
+    CFFI_ASSET_LINE="$(
+      printf '%s' "${RELEASE_JSON}" | jq -r \
+        --arg ver "${CURL_CFFI_VERSION}" \
+        --arg platform "${WHEEL_PLATFORM_TAG}" \
+        '.assets[]
+         | select(.name | startswith("curl_cffi-" + $ver + "-"))
+         | select(.name | contains("-abi3-"))
+         | select(.name | endswith("-" + $platform + ".whl"))
+         | .browser_download_url + "\t" + .name' \
+      | head -n 1
+    )"
+    if [[ -z "${CFFI_ASSET_LINE}" ]]; then
+      echo "error: no curl_cffi wheel asset for target=${TARGET} (platform tag: ${WHEEL_PLATFORM_TAG}) in release v${CURL_CFFI_VERSION}" >&2
+      echo "hint: available assets are:" >&2
+      printf '%s' "${RELEASE_JSON}" | jq -r '.assets[].name' >&2
+      exit 1
+    fi
+    URL="${CFFI_ASSET_LINE%%$'\t'*}"
+    ARCHIVE_NAME="${CFFI_ASSET_LINE#*$'\t'}"
+    ;;
+  curl-impersonate)
+    ARCH="${mapping%% *}"
+    SYSNAME="${mapping##* }"
+    ARCHIVE_NAME="libcurl-impersonate-v${VERSION}.${ARCH}-${SYSNAME}.tar.gz"
+    URL="https://github.com/lexiforest/curl-impersonate/releases/download/v${VERSION}/${ARCHIVE_NAME}"
+    ;;
+  *)
+    echo "error: unknown --source ${SOURCE}" >&2
+    exit 1
+    ;;
+esac
+
+mkdir -p "${OUT_DIR}"
+TMP_ARCHIVE="${OUT_DIR}/${ARCHIVE_NAME}"
+TMP_EXTRACT_DIR="$(mktemp -d "${OUT_DIR}/.extract.XXXXXX")"
+
+if command -v curl >/dev/null 2>&1; then
+  echo "+ curl -fL ${URL} -o ${TMP_ARCHIVE}"
+  curl -fL "${URL}" -o "${TMP_ARCHIVE}"
+elif command -v wget >/dev/null 2>&1; then
+  echo "+ wget -O ${TMP_ARCHIVE} ${URL}"
+  wget -O "${TMP_ARCHIVE}" "${URL}"
+else
+  echo "error: curl or wget is required" >&2
+  exit 1
+fi
+
+if [[ "${SOURCE}" == "curl-cffi" ]]; then
+  if ! command -v unzip >/dev/null 2>&1; then
+    echo "error: unzip is required for source=curl-cffi" >&2
+    exit 1
+  fi
+  echo "+ unzip ${TMP_ARCHIVE} -> ${TMP_EXTRACT_DIR}"
+  unzip -q "${TMP_ARCHIVE}" -d "${TMP_EXTRACT_DIR}"
+else
+  echo "+ unpack ${TMP_ARCHIVE} -> ${TMP_EXTRACT_DIR}"
+  tar -xzf "${TMP_ARCHIVE}" -C "${TMP_EXTRACT_DIR}"
+fi
+
+# Flatten runtime libs to OUT_DIR root so downstream tools can locate them by name.
+collect_patterns=()
+if [[ "${TARGET}" == *windows* ]]; then
+  collect_patterns=("*.dll")
+elif [[ "${TARGET}" == *apple-darwin* || "${TARGET}" == *darwin* ]]; then
+  collect_patterns=("*.dylib")
+else
+  collect_patterns=("*.so*")
+fi
+
+COPIED_RUNTIME_LIST="$(mktemp)"
+COPIED_STATIC_LIST="$(mktemp)"
+
+for pattern in "${collect_patterns[@]}"; do
+  while IFS= read -r -d '' candidate; do
+    dst="${OUT_DIR}/$(basename "${candidate}")"
+    if [[ "${candidate}" != "${dst}" ]]; then
+      cp -f "${candidate}" "${dst}"
+    fi
+    printf '%s\n' "${dst}" >> "${COPIED_RUNTIME_LIST}"
+  done < <(find "${TMP_EXTRACT_DIR}" -type f -name "${pattern}" -print0)
+done
+
+while IFS= read -r -d '' candidate; do
+  dst="${OUT_DIR}/$(basename "${candidate}")"
+  if [[ "${candidate}" != "${dst}" ]]; then
+    cp -f "${candidate}" "${dst}"
+  fi
+  printf '%s\n' "${dst}" >> "${COPIED_STATIC_LIST}"
+done < <(find "${TMP_EXTRACT_DIR}" -type f -name '*.a' -print0)
+
+rm -rf "${TMP_EXTRACT_DIR}"
+
+if [[ "${KEEP_ARCHIVE}" -eq 0 ]]; then
+  rm -f "${TMP_ARCHIVE}"
+fi
+
+echo "done"
+echo "source mode: ${SOURCE}"
+echo "target: ${TARGET}"
+echo "lib version: ${VERSION}"
+if [[ "${SOURCE}" == "curl-cffi" ]]; then
+  echo "curl_cffi version: ${CURL_CFFI_VERSION}"
+fi
+echo "source: ${URL}"
+echo "output: ${OUT_DIR}"
+ls -la "${OUT_DIR}"
+echo "runtime libs:"
+if [[ -s "${COPIED_RUNTIME_LIST}" ]]; then
+  sort -u "${COPIED_RUNTIME_LIST}"
+else
+  echo "(none copied from this archive)"
+fi
+echo "static libs:"
+if [[ -s "${COPIED_STATIC_LIST}" ]]; then
+  sort -u "${COPIED_STATIC_LIST}"
+else
+  echo "(none copied from this archive)"
+fi
+
+shared_count="$(wc -l < "${COPIED_RUNTIME_LIST}" | tr -d '[:space:]')"
+if [[ "${shared_count}" == "0" ]]; then
+  echo "warning: no shared library (*.dylib/*.so/*.dll) found in ${OUT_DIR}" >&2
+  echo "warning: this asset may be static-only (*.a), which cannot be used by runtime dlopen wrappers." >&2
+fi
+
+if [[ "${SOURCE}" == "curl-cffi" && "${shared_count}" != "0" ]]; then
+  runtime_lib_count="$(grep -Ec '/libcurl-impersonate.*\.(dylib|so|dll)(\.[0-9]+)*$' "${COPIED_RUNTIME_LIST}" || true)"
+  runtime_lib_count="$(printf '%s' "${runtime_lib_count}" | tr -d '[:space:]')"
+  if [[ "${runtime_lib_count}" == "0" ]]; then
+    echo "warning: curl_cffi wheel extracted shared objects, but none are named libcurl-impersonate*" >&2
+    echo "warning: this wheel may bundle curl into language-specific extension binaries, not a standalone runtime lib." >&2
+  fi
+fi
+
+rm -f "${COPIED_RUNTIME_LIST}" "${COPIED_STATIC_LIST}"

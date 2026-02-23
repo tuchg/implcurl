@@ -1,0 +1,12 @@
+[package]
+name = "impcurl-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
