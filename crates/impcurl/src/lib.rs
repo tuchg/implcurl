@@ -7,6 +7,7 @@ use impcurl_sys::{
     CurlSlist, CurlWsFrame,
 };
 use std::ffi::CString;
+use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_void};
 use std::ptr;
 use std::sync::OnceLock;
@@ -552,6 +553,7 @@ unsafe fn setopt_slist(
 pub struct WsFrameAssembler {
     frame_flags: i32,
     complete: Vec<u8>,
+    spare: Vec<u8>,
     started: bool,
 }
 
@@ -560,13 +562,23 @@ pub struct WsFrame {
     pub payload: Vec<u8>,
 }
 
+impl WsFrameAssembler {
+    /// Return a used payload buffer so its capacity can be reused for the next frame.
+    pub fn recycle(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        if buf.capacity() > self.spare.capacity() {
+            self.spare = buf;
+        }
+    }
+}
+
 pub fn ws_try_recv_frame(
     api: &CurlApi,
     easy: *mut Curl,
     assembler: &mut WsFrameAssembler,
 ) -> Result<Option<WsFrame>> {
     loop {
-        let mut recv_buf = [0u8; 16 * 1024];
+        let mut recv_buf: [MaybeUninit<u8>; 16 * 1024] = unsafe { MaybeUninit::uninit().assume_init() };
         let mut received = 0usize;
         let mut meta_ptr: *const CurlWsFrame = ptr::null();
 
@@ -592,6 +604,8 @@ pub fn ws_try_recv_frame(
             });
         }
 
+        let received_bytes = unsafe { &*(recv_buf.get_unchecked(..received) as *const [MaybeUninit<u8>] as *const [u8]) };
+
         if !meta_ptr.is_null() {
             let meta = unsafe { &*meta_ptr };
             if !assembler.started {
@@ -604,13 +618,13 @@ pub fn ws_try_recv_frame(
             }
 
             if received > 0 {
-                assembler.complete.extend_from_slice(&recv_buf[..received]);
+                assembler.complete.extend_from_slice(received_bytes);
             }
 
             if meta.bytesleft == 0 {
                 assembler.started = false;
                 let flags = assembler.frame_flags;
-                let payload = std::mem::take(&mut assembler.complete);
+                let payload = std::mem::replace(&mut assembler.complete, std::mem::take(&mut assembler.spare));
                 trace!(len = payload.len(), flags, "ws frame assembled");
                 return Ok(Some(WsFrame { flags, payload }));
             }
@@ -619,15 +633,15 @@ pub fn ws_try_recv_frame(
 
         if received > 0 {
             if assembler.started {
-                assembler.complete.extend_from_slice(&recv_buf[..received]);
+                assembler.complete.extend_from_slice(received_bytes);
                 assembler.started = false;
                 let flags = assembler.frame_flags;
-                let payload = std::mem::take(&mut assembler.complete);
+                let payload = std::mem::replace(&mut assembler.complete, std::mem::take(&mut assembler.spare));
                 return Ok(Some(WsFrame { flags, payload }));
             }
             return Ok(Some(WsFrame {
                 flags: 0,
-                payload: recv_buf[..received].to_vec(),
+                payload: received_bytes.to_vec(),
             }));
         }
     }

@@ -10,12 +10,12 @@ use impcurl_sys::{
     CURL_POLL_OUT, CURL_POLL_REMOVE, CURLE_AGAIN, CURLWS_TEXT, Curl, CurlApi, CurlSocket,
 };
 #[cfg(unix)]
-use std::collections::HashMap;
-#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::raw::{c_int, c_long, c_void};
 use std::path::PathBuf;
+#[cfg(unix)]
+use smallvec::SmallVec;
 #[cfg(unix)]
 use std::sync::Mutex;
 use std::time::Duration;
@@ -146,8 +146,13 @@ impl WsClient {
 
     /// Send raw bytes as a text frame.
     pub fn send(&self, data: &[u8]) -> Result<()> {
+        self.send_owned(data.to_vec())
+    }
+
+    /// Send raw bytes as a text frame, taking ownership of the buffer (zero-copy).
+    pub fn send_owned(&self, data: Vec<u8>) -> Result<()> {
         self.cmd_tx
-            .send(WorkerCommand::Send(data.to_vec()))
+            .send(WorkerCommand::Send(data))
             .map_err(|_| anyhow::anyhow!("websocket closed"))
     }
 
@@ -163,12 +168,18 @@ impl WsClient {
 
     /// Receive the next frame as a UTF-8 string.
     pub async fn recv_text(&mut self) -> Result<Option<String>> {
-        Ok(self.recv().await?.map(|b| String::from_utf8_lossy(&b).into_owned()))
+        Ok(self.recv().await?.map(|b| match String::from_utf8(b) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }))
     }
 
     /// Receive as UTF-8 string with a timeout.
     pub async fn recv_text_timeout(&mut self, max_wait: Duration) -> Result<Option<String>> {
-        Ok(self.recv_timeout(max_wait).await?.map(|b| String::from_utf8_lossy(&b).into_owned()))
+        Ok(self.recv_timeout(max_wait).await?.map(|b| match String::from_utf8(b) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }))
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -254,7 +265,7 @@ impl Drop for WsClient {
 #[cfg(unix)]
 #[derive(Default)]
 struct MultiCallbackState {
-    socket_events: HashMap<CurlSocket, c_int>,
+    socket_events: SmallVec<[(CurlSocket, c_int); 4]>,
     timeout_ms: Option<i64>,
 }
 
@@ -271,34 +282,33 @@ impl AsRawFd for RawSocketFd {
 
 #[cfg(unix)]
 struct AsyncFdCache {
-    fds: HashMap<CurlSocket, (AsyncFd<RawSocketFd>, Interest)>,
+    fds: SmallVec<[(CurlSocket, AsyncFd<RawSocketFd>, Interest); 4]>,
 }
 
 #[cfg(unix)]
 impl AsyncFdCache {
     fn new() -> Self {
-        Self {
-            fds: HashMap::new(),
-        }
+        Self { fds: SmallVec::new() }
     }
 
     fn sync_with(&mut self, socket_events: &[(CurlSocket, c_int)]) {
         self.fds
-            .retain(|sock, _| socket_events.iter().any(|(s, _)| s == sock));
+            .retain(|e| socket_events.iter().any(|&(s, _)| s == e.0));
         for &(socket, ev) in socket_events {
             let Some(interest) = tokio_interest_from_curl_poll(ev) else {
-                self.fds.remove(&socket);
+                self.fds.retain(|e| e.0 != socket);
                 continue;
             };
-            let needs_rebuild = match self.fds.get(&socket) {
-                Some((_, old_interest)) => *old_interest != interest,
+            let needs_rebuild = match self.fds.iter().find(|e| e.0 == socket) {
+                Some(e) => e.2 != interest,
                 None => true,
             };
             if needs_rebuild {
+                self.fds.retain(|e| e.0 != socket);
                 let fd = socket as RawFd;
                 if fd >= 0 {
                     if let Ok(async_fd) = AsyncFd::with_interest(RawSocketFd(fd), interest) {
-                        self.fds.insert(socket, (async_fd, interest));
+                        self.fds.push((socket, async_fd, interest));
                     }
                 }
             }
@@ -307,26 +317,24 @@ impl AsyncFdCache {
 
     async fn wait_any_ready(&self, wait: Duration) -> Option<(CurlSocket, c_int)> {
         if self.fds.len() == 1 {
-            let (&socket, (async_fd, interest)) = self.fds.iter().next().unwrap();
+            let (socket, async_fd, interest) = &self.fds[0];
             return match timeout_async(wait, async_fd.ready(*interest)).await {
                 Ok(Ok(mut guard)) => {
                     let mask = ready_to_mask(&guard);
                     guard.clear_ready();
-                    Some((socket, mask))
+                    Some((*socket, mask))
                 }
                 _ => None,
             };
         }
 
-        // Multi-socket: poll each cached AsyncFd with short per-fd timeout
-        // Typical case: 1-2 sockets per WS connection, so this is O(1)-O(2)
         let per_fd =
             Duration::from_millis((wait.as_millis() / self.fds.len().max(1) as u128).max(1) as u64);
-        for (&socket, (async_fd, interest)) in &self.fds {
+        for (socket, async_fd, interest) in &self.fds {
             if let Ok(Ok(mut guard)) = timeout_async(per_fd, async_fd.ready(*interest)).await {
                 let mask = ready_to_mask(&guard);
                 guard.clear_ready();
-                return Some((socket, mask));
+                return Some((*socket, mask));
             }
         }
         None
@@ -373,9 +381,11 @@ unsafe extern "C" fn multi_socket_callback(
     };
     if let Ok(mut guard) = state.lock() {
         if what == CURL_POLL_REMOVE {
-            guard.socket_events.remove(&socket);
+            guard.socket_events.retain(|e| e.0 != socket);
+        } else if let Some(entry) = guard.socket_events.iter_mut().find(|e| e.0 == socket) {
+            entry.1 = what;
         } else {
-            guard.socket_events.insert(socket, what);
+            guard.socket_events.push((socket, what));
         }
     }
     0
@@ -436,22 +446,18 @@ async fn drive_multi_once_with_cache(
     callback_state: &Mutex<MultiCallbackState>,
     fd_cache: &mut AsyncFdCache,
     default_wait: Duration,
+    sock_buf: &mut SmallVec<[(CurlSocket, c_int); 4]>,
 ) -> Result<()> {
-    let (socket_events, timer_timeout_ms) = {
+    let timer_timeout_ms = {
         let guard = callback_state
             .lock()
             .map_err(|_| anyhow::anyhow!("curl multi callback state lock poisoned"))?;
-        (
-            guard
-                .socket_events
-                .iter()
-                .map(|(s, e)| (*s, *e))
-                .collect::<Vec<_>>(),
-            guard.timeout_ms,
-        )
+        sock_buf.clear();
+        sock_buf.extend_from_slice(&guard.socket_events);
+        guard.timeout_ms
     };
 
-    fd_cache.sync_with(&socket_events);
+    fd_cache.sync_with(sock_buf);
 
     let default_wait_ms = default_wait.as_millis().min(i64::MAX as u128) as i64;
     let wait_ms = timer_timeout_ms
@@ -530,7 +536,8 @@ async fn run_worker_loop_async(
     let mut assembler = WsFrameAssembler::default();
     let mut fd_cache = AsyncFdCache::new();
     let mut pending_send: Option<(Vec<u8>, usize)> = None;
-    let mut cmd_buf: Vec<WorkerCommand> = Vec::new();
+    let mut pending_cmd: Option<WorkerCommand> = None;
+    let mut sock_buf: SmallVec<[(CurlSocket, c_int); 4]> = SmallVec::new();
     loop {
         // recv all available frames
         while let Some(frame) = ws_try_recv_frame(api, easy_handle as *mut Curl, &mut assembler)? {
@@ -559,8 +566,8 @@ async fn run_worker_loop_async(
             }
         }
 
-        // process buffered commands from select!, then drain channel
-        for cmd in cmd_buf.drain(..) {
+        // process buffered command from select!, then drain channel
+        if let Some(cmd) = pending_cmd.take() {
             if handle_cmd(api, easy_handle, cmd, &mut pending_send, &event_tx)? {
                 return Ok(());
             }
@@ -586,14 +593,14 @@ async fn run_worker_loop_async(
             biased;
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(c) => cmd_buf.push(c),
+                    Some(c) => pending_cmd = Some(c),
                     None => {
                         let _ = event_tx.try_send(WorkerEvent::Shutdown);
                         return Ok(());
                     }
                 }
             }
-            result = drive_multi_once_with_cache(multi, callback_state, &mut fd_cache, loop_poll_timeout) => {
+            result = drive_multi_once_with_cache(multi, callback_state, &mut fd_cache, loop_poll_timeout, &mut sock_buf) => {
                 result?;
             }
         }

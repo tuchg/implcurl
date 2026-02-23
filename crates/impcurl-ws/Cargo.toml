@@ -15,6 +15,7 @@ anyhow.workspace = true
 impcurl = { path = "../impcurl", version = "0.1.0" }
 impcurl-sys = { path = "../impcurl-sys", version = "0.1.0" }
 libc = "0.2"
+smallvec = "1"
 tokio.workspace = true
 tracing.workspace = true
 
