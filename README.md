@@ -1,5 +1,10 @@
 # impcurl
 
+[![impcurl-sys](https://img.shields.io/crates/v/impcurl-sys?label=impcurl-sys)](https://crates.io/crates/impcurl-sys)
+[![impcurl](https://img.shields.io/crates/v/impcurl?label=impcurl)](https://crates.io/crates/impcurl)
+[![impcurl-ws](https://img.shields.io/crates/v/impcurl-ws?label=impcurl-ws)](https://crates.io/crates/impcurl-ws)
+[![MIT](https://img.shields.io/crates/l/impcurl)](LICENSE)
+
 Rust WebSocket client with TLS fingerprint impersonation, powered by [libcurl-impersonate](https://github.com/lexiforest/curl-impersonate).
 
 Bypass TLS fingerprinting by impersonating real browser signatures (Chrome, Safari, Firefox, Edge, Tor).
