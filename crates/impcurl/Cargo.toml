@@ -11,6 +11,6 @@ keywords = ["curl", "impersonate", "websocket", "tls", "fingerprint"]
 categories = ["network-programming", "web-programming"]
 
 [dependencies]
-impcurl-sys = { path = "../impcurl-sys", version = "0.1.0" }
+impcurl-sys = { path = "../impcurl-sys", version = "0.2.0" }
 thiserror.workspace = true
 tracing.workspace = true
