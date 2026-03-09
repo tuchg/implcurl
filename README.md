@@ -15,30 +15,36 @@ Bypass TLS fingerprinting by impersonating real browser signatures (Chrome, Safa
 |-------|-------------|
 | `impcurl-sys` | Dynamic FFI bindings for `libcurl-impersonate` with auto-fetch |
 | `impcurl` | Safe blocking wrapper — WebSocket handshake, send, recv |
-| `impcurl-ws` | Async tokio client with builder API |
+| `impcurl-ws` | Async tokio `Stream + Sink` WebSocket connection |
 
 ## Quick Start
 
 ```toml
 [dependencies]
-impcurl-ws = "0.1"
+impcurl-ws = "0.2"
+futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust
-use impcurl_ws::WsClient;
+use futures_util::{SinkExt, StreamExt};
+use impcurl_ws::{Message, WsConnection};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut ws = WsClient::connect("wss://echo.websocket.org").await?;
+    let mut ws = WsConnection::connect("wss://echo.websocket.org").await?;
 
-    ws.send_text("hello")?;
+    ws.send(Message::Text("hello".to_owned())).await?;
 
-    if let Some(data) = ws.recv_timeout(std::time::Duration::from_secs(5)).await? {
-        println!("{}", String::from_utf8_lossy(&data));
+    if let Some(message) = ws.next().await.transpose()? {
+        match message {
+            Message::Text(text) => println!("{text}"),
+            Message::Binary(bytes) => println!("{} bytes", bytes.len()),
+            Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {}
+        }
     }
 
-    ws.shutdown().await
+    Ok(())
 }
 ```
 
@@ -46,15 +52,18 @@ async fn main() -> anyhow::Result<()> {
 
 ```rust
 use impcurl::ImpersonateTarget;
-use impcurl_ws::WsClient;
+use impcurl_ws::{ControlFrameMode, WsConnection};
 use std::time::Duration;
 
-let mut ws = WsClient::builder("wss://example.com/ws")
+let ws = WsConnection::builder("wss://example.com/ws")
     .header("Origin", "https://example.com")
     .header("User-Agent", "Mozilla/5.0 ...")
     .proxy("socks5h://127.0.0.1:1080")
     .impersonate(ImpersonateTarget::Chrome136)
     .connect_timeout(Duration::from_secs(10))
+    .control_frame_mode(ControlFrameMode::Manual)
+    .read_buffer_messages(32)
+    .write_buffer_messages(32)
     .verbose(true)
     .connect()
     .await?;
@@ -64,12 +73,13 @@ let mut ws = WsClient::builder("wss://example.com/ws")
 
 The `libcurl-impersonate` shared library is resolved at runtime in this order:
 
-1. `WsClient::builder(...).lib_path(...)` — explicit path
-2. `CURL_IMPERSONATE_LIB` env var
-3. Near executable (`../lib/` and side-by-side)
-4. `IMPCURL_LIB_DIR` env var
-5. `~/.impcurl/lib`, `~/.cuimp/binaries`
-6. Auto-fetch from [curl_cffi](https://github.com/lexiforest/curl_cffi) wheel (enabled by default)
+1. `CURL_IMPERSONATE_LIB` env var
+2. Near executable (`../lib/` and side-by-side)
+3. `IMPCURL_LIB_DIR` env var
+4. `~/.impcurl/lib`, `~/.cuimp/binaries`
+5. Auto-fetch from [curl_cffi](https://github.com/lexiforest/curl_cffi) wheel (enabled by default)
+
+`impcurl-ws` does not expose a `lib_path(...)` builder escape hatch anymore. Runtime library resolution is treated as deployment/runtime configuration rather than a connection-level concern.
 
 ### Auto-fetch Controls
 

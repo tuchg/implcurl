@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
-use impcurl_ws::WsClient;
+use futures_util::{SinkExt, StreamExt};
+use impcurl_ws::{Message, WsConnection};
 use serde_json::{Value, json};
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PUBLIC_ECHO_URL: &str = "wss://ws.postman-echo.com/raw";
@@ -21,7 +21,7 @@ async fn three_public_websocket_connections_do_not_mix_messages() -> Result<()> 
     let ws_url = std::env::var("IMPCURL_PUBLIC_ECHO_URL")
         .unwrap_or_else(|_| DEFAULT_PUBLIC_ECHO_URL.to_owned());
     let round_trips_per_client = parse_round_trips_per_client()?;
-    let lib_path = impcurl_sys::resolve_impersonate_lib_path(&[]).with_context(|| {
+    let _ = impcurl_sys::resolve_impersonate_lib_path(&[]).with_context(|| {
         "failed to resolve libcurl-impersonate; set CURL_IMPERSONATE_LIB to a valid runtime library"
     })?;
     let run_id = format!("impcurl-ws-{}-{}", std::process::id(), now_millis());
@@ -29,12 +29,10 @@ async fn three_public_websocket_connections_do_not_mix_messages() -> Result<()> 
     let mut tasks = Vec::with_capacity(CLIENT_IDS.len());
     for &client_id in &CLIENT_IDS {
         let ws_url = ws_url.clone();
-        let lib_path = lib_path.clone();
         let run_id = run_id.clone();
         let round_trips_per_client = round_trips_per_client;
         tasks.push(tokio::spawn(async move {
-            run_client_round_trips(client_id, ws_url, lib_path, run_id, round_trips_per_client)
-                .await
+            run_client_round_trips(client_id, ws_url, run_id, round_trips_per_client).await
         }));
     }
 
@@ -69,12 +67,10 @@ fn now_millis() -> u128 {
 async fn run_client_round_trips(
     client_id: &'static str,
     ws_url: String,
-    lib_path: PathBuf,
     run_id: String,
     round_trips_per_client: usize,
 ) -> Result<()> {
-    let mut client = WsClient::builder(ws_url.clone())
-        .lib_path(lib_path)
+    let mut client = WsConnection::builder(ws_url.clone())
         .connect_timeout(Duration::from_secs(15))
         .connect()
         .await
@@ -91,7 +87,8 @@ async fn run_client_round_trips(
         .to_string();
 
         client
-            .send_text(&payload)
+            .send(Message::Text(payload.clone()))
+            .await
             .with_context(|| format!("failed sending payload for client {client_id} seq {seq}"))?;
 
         let echoed = recv_expected_echo(&mut client, client_id, &run_id, seq).await?;
@@ -116,16 +113,11 @@ async fn run_client_round_trips(
             }
         }
     }
-
-    client
-        .shutdown()
-        .await
-        .with_context(|| format!("failed shutting down websocket client {client_id}"))?;
     Ok(())
 }
 
 async fn recv_expected_echo(
-    client: &mut WsClient,
+    client: &mut WsConnection,
     expected_client_id: &str,
     run_id: &str,
     seq: usize,
@@ -137,11 +129,23 @@ async fn recv_expected_echo(
             bail!("timed out waiting for echoed payload for client {expected_client_id} seq {seq}");
         }
         let wait = (deadline - now).min(Duration::from_secs(5));
-        let Some(data) = client.recv_timeout(wait).await.with_context(|| {
-            format!("failed receiving websocket echo for {expected_client_id} seq {seq}")
-        })?
+        let Some(message) = tokio::time::timeout(wait, client.next())
+            .await
+            .with_context(|| {
+                format!("failed receiving websocket echo for {expected_client_id} seq {seq}")
+            })?
         else {
             continue;
+        };
+
+        let message = message.with_context(|| {
+            format!("websocket stream returned error for {expected_client_id} seq {seq}")
+        })?;
+
+        let data = match message {
+            Message::Text(text) => text.into_bytes(),
+            Message::Binary(bytes) => bytes.to_vec(),
+            Message::Ping(_) | Message::Pong(_) | Message::Close(_) => continue,
         };
 
         let Ok(value) = serde_json::from_slice::<Value>(&data) else {
